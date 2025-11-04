@@ -18,7 +18,7 @@ pipeline {
         stage('Test AWS Credentials') {
             steps {
                 withCredentials([[ 
-                    $class: 'AmazonWebServicesCredentialsBinding', 
+                    $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'aws-creds'
                 ]]) {
                     sh 'aws sts get-caller-identity'
@@ -47,36 +47,35 @@ pipeline {
         }
 
         stage('Create EKS Cluster') {
-    steps {
-        withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws-creds'
-        ]]) {
-            sh '''
-            echo "🚀 Checking if EKS cluster already exists..."
-            if eksctl get cluster --name nodejs-eks-cluster --region us-east-1 >/dev/null 2>&1; then
-                echo "✅ EKS cluster already exists — skipping creation."
-            else
-                echo "🚀 Creating new EKS cluster..."
-                eksctl create cluster \
-                    --name nodejs-eks-cluster \
-                    --region us-east-1 \
-                    --nodegroup-name workers \
-                    --node-type t3.medium \
-                    --nodes 2 \
-                    --managed \
-                    --version 1.28
-            fi
-            '''
-        	}
-    	    }
-	}
-
+            steps {
+                withCredentials([[ 
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-creds'
+                ]]) {
+                    sh '''
+                    echo "🚀 Checking if EKS cluster already exists..."
+                    if eksctl get cluster --name nodejs-eks-cluster --region us-east-1 >/dev/null 2>&1; then
+                        echo "✅ EKS cluster already exists — skipping creation."
+                    else
+                        echo "🚀 Creating new EKS cluster..."
+                        eksctl create cluster \
+                            --name nodejs-eks-cluster \
+                            --region us-east-1 \
+                            --nodegroup-name workers \
+                            --node-type t3.medium \
+                            --nodes 2 \
+                            --managed \
+                            --version 1.28
+                    fi
+                    '''
+                }
+            }
+        }
 
         stage('Configure Access') {
             steps {
                 withCredentials([[ 
-                    $class: 'AmazonWebServicesCredentialsBinding', 
+                    $class: 'AmazonWebServicesCredentialsBinding',
                     credentialsId: 'aws-creds'
                 ]]) {
                     sh '''
@@ -89,53 +88,52 @@ pipeline {
         }
 
         stage('Deploy App') {
-    steps {
-        withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws-creds'
-        ]]) {
-            sh '''
-            echo "🚀 Deploying application to EKS..."
-            aws eks update-kubeconfig --region us-east-1 --name nodejs-eks-cluster
-            kubectl apply -f deployment.yaml
-            '''
+            steps {
+                withCredentials([[ 
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-creds'
+                ]]) {
+                    sh '''
+                    echo "🚀 Deploying application to EKS..."
+                    aws eks update-kubeconfig --region us-east-1 --name nodejs-eks-cluster
+                    kubectl apply -f deployment.yaml
+                    '''
+                }
             }
-    	  }
-	}
-
+        }
 
         stage('Verify Deployment') {
-    steps {
-        withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws-creds'
-        ]]) {
-            sh '''
-            echo "🔍 Verifying deployment..."
-            aws eks update-kubeconfig --region us-east-1 --name nodejs-eks-cluster
-            kubectl get pods
-            kubectl get svc
-            echo "✅ Verification complete"
-            '''
+            steps {
+                withCredentials([[ 
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-creds'
+                ]]) {
+                    sh '''
+                    echo "🔍 Verifying deployment..."
+                    aws eks update-kubeconfig --region us-east-1 --name nodejs-eks-cluster
+                    kubectl get pods
+                    kubectl get svc
+                    echo "✅ Verification complete"
+                    '''
+                }
+            }
+        }
+
+        stage('Get App URL') {
+            steps {
+                withCredentials([[ 
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-creds'
+                ]]) {
+                    sh '''
+                    echo "🌐 Fetching LoadBalancer URL..."
+                    aws eks update-kubeconfig --region us-east-1 --name nodejs-eks-cluster
+                    kubectl get svc nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+                    '''
+                }
+            }
         }
     }
-}
-
-	stage('Get App URL') {
-   steps {
-        withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws-creds'
-        ]]) {
-            sh '''
-            echo "🌐 Fetching LoadBalancer URL..."
-            aws eks update-kubeconfig --region us-east-1 --name nodejs-eks-cluster
-            kubectl get svc nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-            '''
-        }
-    }
-}
-
 
     post {
         failure {
