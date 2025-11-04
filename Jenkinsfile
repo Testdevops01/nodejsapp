@@ -105,25 +105,37 @@ pipeline {
 
 
         stage('Verify Deployment') {
-            steps {
-                sh '''
-                echo "🔍 Verifying deployment..."
-                kubectl get pods
-                kubectl get svc
-                echo "✅ Verification complete"
-                '''
-            }
-        }
-
-        stage('Get App URL') {
-            steps {
-                sh '''
-                echo "🌐 Fetching LoadBalancer URL..."
-                kubectl get svc nodejsapp-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-                '''
-            }
+    steps {
+        withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding',
+            credentialsId: 'aws-creds'
+        ]]) {
+            sh '''
+            echo "🔍 Verifying deployment..."
+            aws eks update-kubeconfig --region us-east-1 --name nodejs-eks-cluster
+            kubectl get pods
+            kubectl get svc
+            echo "✅ Verification complete"
+            '''
         }
     }
+}
+
+	stage('Get App URL') {
+   steps {
+        withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding',
+            credentialsId: 'aws-creds'
+        ]]) {
+            sh '''
+            echo "🌐 Fetching LoadBalancer URL..."
+            aws eks update-kubeconfig --region us-east-1 --name nodejs-eks-cluster
+            kubectl get svc nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+            '''
+        }
+    }
+}
+
 
     post {
         failure {
