@@ -47,26 +47,31 @@ pipeline {
         }
 
         stage('Create EKS Cluster') {
-            steps {
-                withCredentials([[ 
-                    $class: 'AmazonWebServicesCredentialsBinding', 
-                    credentialsId: 'aws-creds'
-                ]]) {
-                    sh '''
-                    echo "🚀 Creating EKS cluster..."
-                    eksctl create cluster \
-                        --name nodejs-eks-cluster \
-                        --region us-east-1 \
-                        --nodegroup-name workers \
-                        --node-type t3.medium \
-                        --nodes 2 \
-                        --managed \
-                        --version 1.28
-                    echo "✅ EKS cluster created"
-                    '''
-                }
-            }
-        }
+    steps {
+        withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding',
+            credentialsId: 'aws-creds'
+        ]]) {
+            sh '''
+            echo "🚀 Checking if EKS cluster already exists..."
+            if eksctl get cluster --name nodejs-eks-cluster --region us-east-1 >/dev/null 2>&1; then
+                echo "✅ EKS cluster already exists — skipping creation."
+            else
+                echo "🚀 Creating new EKS cluster..."
+                eksctl create cluster \
+                    --name nodejs-eks-cluster \
+                    --region us-east-1 \
+                    --nodegroup-name workers \
+                    --node-type t3.medium \
+                    --nodes 2 \
+                    --managed \
+                    --version 1.28
+            fi
+            '''
+        	}
+    	    }
+	}
+
 
         stage('Configure Access') {
             steps {
