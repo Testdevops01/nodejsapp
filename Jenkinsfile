@@ -26,7 +26,25 @@ stage('Test AWS Credentials') {
 }
 
 
-        stage('Create EKS Cluster') {
+                stage('Build and Push Docker Image') {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: 'dockerhub-login', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')
+                ]) {
+                    sh """
+                    echo "🐳 Building and pushing Docker image..."
+                    docker login -u "$DOCKER_USER" -p "$DOCKER_PASS"
+                    docker build -t anusha987/nodejsapp:latest .
+                    docker push anusha987/nodejsapp:latest
+                    echo "✅ Docker image pushed successfully"
+                    """
+                }
+            }
+        }
+
+
+
+	stage('Create EKS Cluster') {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
