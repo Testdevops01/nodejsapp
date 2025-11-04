@@ -94,11 +94,16 @@ stage('Test AWS Credentials') {
 
         stage('Verify Deployment') {
             steps {
-                sh """
-                echo "🔍 Verifying deployment..."
-                kubectl get pods
-                kubectl get svc
-                """
+
+                  withAWS(credentials: 'aws-creds', region: "${AWS_REGION}") {
+            sh """
+            echo "🔍 Verifying deployment..."
+            sleep 10
+            kubectl get pods -o wide
+            kubectl get svc
+            echo "✅ Deployment verification complete!"
+            """
+        }
             }
         }
     }
