@@ -1,77 +1,119 @@
-
 pipeline {
     agent any
+    
     environment {
+        AWS_ACCOUNT_ID = '843559766730'
         AWS_REGION = 'us-east-1'
-        EKS_CLUSTER_NAME = 'nodejs-app-cluster'
-        DOCKER_IMAGE = 'kushakumar/nodejsapp-9.0:latest'
-        GIT_REPO = 'your-repo-url-here'
+        ECR_REPO = 'nodejs-eks-app'
+        CLUSTER_NAME = 'nodejs-eks-cluster'
+        DOCKER_IMAGE = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:latest"
     }
+    
     stages {
-        stage('Checkout Code') {
+        stage('Checkout Source') {
             steps {
-                git branch: 'main', 
-                    url: "${env.GIT_REPO}",
-                    credentialsId: 'your-git-credentials'
+                checkout scm
+                sh 'echo "Code checked out successfully"'
+                sh 'ls -la'
             }
         }
         
-        stage('Setup AWS CLI and kubectl') {
+        stage('Build Docker Image') {
             steps {
-                sh '''
-                    # Install kubectl
-                    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-                    chmod +x ./kubectl
-                    sudo mv ./kubectl /usr/local/bin/kubectl
-                    
-                    # Install eksctl
-                    curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
-                    sudo mv /tmp/eksctl /usr/local/bin
-                    
-                    # Verify installations
-                    eksctl version
-                    kubectl version --client
-                '''
+                script {
+                    echo "Building Docker image..."
+                    sh """
+                    docker build -t ${ECR_REPO}:latest .
+                    """
+                }
+            }
+        }
+        
+        stage('Login to AWS ECR') {
+            steps {
+                script {
+                    sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | \
+                    docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                    """
+                }
+            }
+        }
+        
+        stage('Create ECR Repository') {
+            steps {
+                script {
+                    try {
+                        sh """
+                        aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION}
+                        echo "ECR repository already exists"
+                        """
+                    } catch (Exception e) {
+                        echo "Creating ECR repository: ${ECR_REPO}"
+                        sh """
+                        aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION}
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Push to ECR') {
+            steps {
+                script {
+                    sh """
+                    docker tag ${ECR_REPO}:latest ${DOCKER_IMAGE}
+                    docker push ${DOCKER_IMAGE}
+                    echo "Image pushed: ${DOCKER_IMAGE}"
+                    """
+                }
             }
         }
         
         stage('Create EKS Cluster') {
             steps {
-                sh """
-                    eksctl create cluster \\
-                    --name ${env.EKS_CLUSTER_NAME} \\
-                    --region ${env.AWS_REGION} \\
-                    --nodegroup-name workers \\
-                    --node-type t3.medium \\
-                    --nodes 2 \\
-                    --nodes-min 1 \\
-                    --nodes-max 3 \\
-                    --managed \\
-                    --ssh-access \\
-                    --ssh-public-key your-key-pair \\
-                    --version 1.28
-                """
+                script {
+                    // Check if cluster exists
+                    def clusterExists = sh(
+                        script: "aws eks list-clusters --region ${AWS_REGION} --query 'clusters' --output text | grep ${CLUSTER_NAME} || true",
+                        returnStatus: true
+                    )
+                    
+                    if (clusterExists != 0) {
+                        echo "Creating EKS cluster: ${CLUSTER_NAME}"
+                        sh """
+                        eksctl create cluster \
+                        --name ${CLUSTER_NAME} \
+                        --region ${AWS_REGION} \
+                        --nodegroup-name workers \
+                        --node-type t3.medium \
+                        --nodes 2 \
+                        --nodes-min 1 \
+                        --nodes-max 3 \
+                        --managed
+                        """
+                    } else {
+                        echo "EKS cluster ${CLUSTER_NAME} already exists"
+                    }
+                }
             }
         }
         
-        stage('Configure kubectl') {
-            steps {
-                sh """
-                    aws eks update-kubeconfig --region ${env.AWS_REGION} --name ${env.EKS_CLUSTER_NAME}
-                    kubectl get nodes
-                """
-            }
-        }
-        
-        stage('Build and Push Docker Image') {
+        stage('Configure Kubectl') {
             steps {
                 script {
-                    // Build Docker image
-                    docker.build("${env.DOCKER_IMAGE}")
+                    sh """
+                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+                    kubectl cluster-info
+                    """
                     
-                    // Push to Docker Hub
-                    docker.withRegistry('', 'docker-hub-credentials') {
-                        docker.image("${env.DOCKER_IMAGE}").push()
+                    // Wait for nodes to be ready
+                    retry(5) {
+                        sh """
+                        kubectl get nodes
+                        kubectl wait --for=condition=Ready nodes --all --timeout=60s
+                        """
+                        sleep 10
                     }
                 }
             }
@@ -79,59 +121,77 @@ pipeline {
         
         stage('Deploy to EKS') {
             steps {
-                sh """
-                    # Apply the single YAML file containing both Deployment and Service
+                script {
+                    // Update deployment with actual ECR image
+                    sh """
+                    sed -i 's|kushakumar/nodejsapp-9.0:latest|${DOCKER_IMAGE}|g' deployment.yaml
+                    """
+                    
+                    echo "Deploying application to EKS..."
+                    sh """
                     kubectl apply -f deployment.yaml
-                    
-                    # Verify deployment
-                    echo "=== Deployments ==="
-                    kubectl get deployments
-                    
-                    echo "=== Services ==="
-                    kubectl get services
-                    
-                    echo "=== Pods ==="
-                    kubectl get pods
-                """
+                    """
+                }
             }
         }
         
-        stage('Test Application') {
+        stage('Verify Deployment') {
             steps {
-                sh """
-                    # Wait for service to get external IP
-                    echo "Waiting for LoadBalancer to be ready..."
-                    for i in {1..30}; do
-                        if kubectl get service nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null; then
-                            break
+                script {
+                    echo "Waiting for deployment to complete..."
+                    retry(10) {
+                        sh """
+                        kubectl rollout status deployment/nodejs-app --timeout=180s
+                        """
+                    }
+                    
+                    echo "Checking deployment status..."
+                    sh """
+                    kubectl get deployments,svc,pods -o wide
+                    """
+                }
+            }
+        }
+        
+        stage('Health Check') {
+            steps {
+                script {
+                    echo "Testing application..."
+                    retry(12) {
+                        sh """
+                        LB_URL=\$(kubectl get service nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+                        if [ -z "\$LB_URL" ]; then
+                            echo "LoadBalancer not ready yet..."
+                            exit 1
+                        else
+                            echo "Application URL: http://\$LB_URL"
+                            curl -f http://\$LB_URL/ || exit 1
+                            echo "✅ Application is working!"
                         fi
-                        sleep 10
-                    done
-                    
-                    SERVICE_URL=\$(kubectl get service nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-                    echo "Service URL: http://\${SERVICE_URL}"
-                    
-                    # Test the application
-                    echo "Testing the application..."
-                    curl -f http://\${SERVICE_URL} || exit 1
-                """
+                        """
+                        sleep 15
+                    }
+                }
             }
         }
     }
     
     post {
         always {
-            echo 'Pipeline execution completed'
+            echo "Pipeline execution completed - ${currentBuild.currentResult}"
         }
         success {
-            echo 'Application deployed successfully!'
-            sh """
-                SERVICE_URL=\$(kubectl get service nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "not-available")
-                echo "Your application is available at: http://\${SERVICE_URL}"
-            """
+            echo "✅ Deployment Successful!"
+            script {
+                def lbUrl = sh(
+                    script: "kubectl get service nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'",
+                    returnStdout: true
+                ).trim()
+                echo "🎉 Your app is live at: http://${lbUrl}"
+            }
         }
         failure {
-            echo 'Pipeline failed!'
+            echo "❌ Deployment Failed!"
         }
     }
 }
