@@ -2,54 +2,41 @@ pipeline {
     agent any
 
     environment {
-        CLUSTER_NAME = "nodejs-eks-cluster"
-        AWS_REGION   = "us-east-1"
+        AWS_REGION = 'us-east-1'
+        CLUSTER_NAME = 'nodejs-eks-cluster'
+        DOCKER_IMAGE = 'anusha987/nodejsapp:latest'
     }
 
     stages {
         stage('Checkout Code') {
             steps {
                 checkout scm
-                echo "✅ Code checkout completed"
+                sh 'echo "✅ Code checkout completed"'
             }
         }
 
-stage('Test AWS Credentials') {
-    steps {
-        withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws-creds'
-        ]]) {
-            sh 'aws sts get-caller-identity'
-        }
-    }
-}
-
-
-                stage('Build and Push Docker Image') {
+        stage('Build and Push Docker Image') {
             steps {
-                withCredentials([
-                    usernamePassword(credentialsId: 'dockerhub-login', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')
-                ]) {
+                script {
                     sh """
-                    echo "🐳 Building and pushing Docker image..."
-                    docker login -u "$DOCKER_USER" -p "$DOCKER_PASS"
-                    docker build -t anusha987/nodejsapp:latest .
-                    docker push anusha987/nodejsapp:latest
-                    echo "✅ Docker image pushed successfully"
+                    echo "🐳 Building Docker image..."
+                    docker build -t ${DOCKER_IMAGE} .
+
+                    echo "🔑 Logging in to Docker Hub..."
+                    echo "${DOCKERHUB_PASS}" | docker login -u "${DOCKERHUB_USER}" --password-stdin
+
+                    echo "📤 Pushing image to Docker Hub..."
+                    docker push ${DOCKER_IMAGE}
+
+                    echo "✅ Docker image pushed successfully!"
                     """
                 }
             }
         }
 
-
-
-	stage('Create EKS Cluster') {
+        stage('Create EKS Cluster') {
             steps {
-                withCredentials([[
-                    $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-creds'
-                ]]) {
+                script {
                     sh """
                     echo "🚀 Creating EKS cluster..."
                     eksctl create cluster \
@@ -60,68 +47,62 @@ stage('Test AWS Credentials') {
                         --nodes 2 \
                         --managed \
                         --version 1.28
-                    echo "✅ EKS cluster created successfully"
+                    echo "✅ EKS cluster created"
                     """
                 }
             }
         }
 
-        stage('Configure Kubernetes Access') {
+        stage('Configure Access') {
             steps {
-                withCredentials([[
-                    $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-creds'
-                ]]) {
+                script {
                     sh """
                     echo "🔧 Configuring kubectl access..."
                     aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
-
-                    # Quick check - if nodes exist, cluster is ready
-                    if kubectl get nodes --no-headers 2>/dev/null; then
-                        echo "✅ Cluster is ready and accessible"
-                    else
-                        echo "⏳ Waiting for cluster to be ready..."
-                        sleep 30
-                        kubectl get nodes
-                    fi
+                    sleep 60
+                    kubectl get nodes
                     """
                 }
             }
         }
 
-        stage('Deploy/Redeploy Application') {
+        stage('Deploy App') {
             steps {
-                withCredentials([[
-                    $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-creds'
-                ]]) {
+                script {
                     sh """
                     echo "📦 Deploying application..."
-
-                    # Delete existing deployment if exists (for clean redeploy)
                     kubectl delete -f deployment.yaml --ignore-not-found=true
-                    sleep 5
-
-                    # Apply new deployment
                     kubectl apply -f deployment.yaml
-                    echo "✅ Application deployment initiated"
+                    sleep 30
+                    kubectl get pods
                     """
                 }
             }
         }
 
-        stage('Verify Deployment') {
+        stage('Verify') {
             steps {
-
-                  withAWS(credentials: 'aws-creds', region: "${AWS_REGION}") {
-            sh """
-            echo "🔍 Verifying deployment..."
-            sleep 10
-            kubectl get pods -o wide
-            kubectl get svc
-            echo "✅ Deployment verification complete!"
-            """
+                script {
+                    sh """
+                    echo "🔍 Verifying deployment..."
+                    kubectl rollout status deployment/nodejs-app --timeout=300s
+                    echo "✅ Deployment successful"
+                    """
+                }
+            }
         }
+
+        stage('Get URL') {
+            steps {
+                script {
+                    sh """
+                    echo "🌐 Getting application URL..."
+                    sleep 30
+                    kubectl get service nodejs-app
+                    echo "📋 Run this command to get your URL:"
+                    echo "kubectl get service nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+                    """
+                }
             }
         }
     }
@@ -129,10 +110,7 @@ stage('Test AWS Credentials') {
     post {
         success {
             echo "🎉 Pipeline completed successfully!"
-        }
-        failure {
-            echo "❌ Pipeline failed — check the logs above for details."
+            echo "Your EKS cluster is ready and application is deployed!"
         }
     }
 }
-
