@@ -64,77 +64,31 @@ pipeline {
             }
         }
         
-        stage('Cleanup Existing EKS Stack') {
-            steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                    script {
-                        // Check if CloudFormation stack exists but cluster doesn't
-                        def stackExists = sh(
-                            script: """
-                                aws cloudformation describe-stacks --stack-name eksctl-nodejs-eks-cluster-cluster --region $AWS_REGION > /dev/null 2>&1 && echo "exists" || echo "not_exists"
-                            """,
-                            returnStdout: true
-                        ).trim()
-                        
-                        def clusterExists = sh(
-                            script: """
-                                aws eks describe-cluster --name $EKS_CLUSTER_NAME --region $AWS_REGION > /dev/null 2>&1 && echo "exists" || echo "not_exists"
-                            """,
-                            returnStdout: true
-                        ).trim()
-                        
-                        if (stackExists == "exists" && clusterExists == "not_exists") {
-                            echo "🧹 Cleaning up orphaned CloudFormation stack..."
-                            sh """
-                                eksctl delete cluster --region $AWS_REGION --name $EKS_CLUSTER_NAME --wait
-                            """
-                            echo "✅ Orphaned stack cleaned up"
-                        } else if (clusterExists == "exists") {
-                            echo "✅ EKS cluster already exists - skipping creation"
-                            currentBuild.result = 'SUCCESS' // Don't fail if cluster exists
-                        } else {
-                            echo "✅ No cleanup needed"
-                        }
-                    }
-                }
-            }
-        }
-        
-        stage('Create EKS Cluster if Not Exists') {
+        stage('Create EKS Cluster') {
             options {
                 timeout(time: 45, unit: 'MINUTES')
             }
             steps {
                 withAWS(credentials: 'aws-creds', region: 'us-east-1') {
                     script {
-                        def clusterExists = sh(
-                            script: """
-                                aws eks describe-cluster --name $EKS_CLUSTER_NAME --region $AWS_REGION > /dev/null 2>&1 && echo "exists" || echo "not_exists"
-                            """,
-                            returnStdout: true
-                        ).trim()
-                        
-                        if (clusterExists == "not_exists") {
-                            echo "🚀 Creating EKS cluster: $EKS_CLUSTER_NAME"
-                            sh """
-                                # Use simpler cluster creation with explicit auto-mode disable
-                                eksctl create cluster \
-                                    --name $EKS_CLUSTER_NAME \
-                                    --region $AWS_REGION \
-                                    --version 1.28 \
-                                    --nodegroup-name workers \
-                                    --node-type t3.medium \
-                                    --nodes 2 \
-                                    --nodes-min 1 \
-                                    --nodes-max 3 \
-                                    --managed \
-                                    --auto-kubeconfig \
-                                    --verbose 4
-                            """
-                            echo "✅ EKS cluster created successfully"
-                        } else {
-                            echo "✅ EKS cluster already exists - skipping creation"
-                        }
+                        echo "🚀 Creating EKS cluster: $EKS_CLUSTER_NAME"
+                        sh """
+                            # Create EKS cluster with nodegroup
+                            eksctl create cluster \
+                                --name $EKS_CLUSTER_NAME \
+                                --region $AWS_REGION \
+                                --version 1.28 \
+                                --nodegroup-name workers \
+                                --node-type t3.medium \
+                                --nodes 2 \
+                                --nodes-min 1 \
+                                --nodes-max 3 \
+                                --managed \
+                                --asg-access \
+                                --full-ecr-access \
+                                --auto-kubeconfig
+                        """
+                        echo "✅ EKS cluster created successfully"
                     }
                 }
             }
@@ -149,9 +103,39 @@ pipeline {
                         echo "✅ kubeconfig updated"
                         
                         # Verify cluster access
+                        echo "🔍 Testing cluster access..."
                         kubectl cluster-info
+                        echo "📊 Checking nodes..."
                         kubectl get nodes
                     """
+                }
+            }
+        }
+        
+        stage('Setup Docker Registry Secret') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                    script {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'docker-creds',
+                            usernameVariable: 'DOCKER_USER',
+                            passwordVariable: 'DOCKER_PASS'
+                        )]) {
+                            sh """
+                                aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+                                
+                                # Create docker registry secret
+                                kubectl create secret docker-registry docker-credentials \
+                                    --docker-server=https://index.docker.io/v1/ \
+                                    --docker-username=$DOCKER_USER \
+                                    --docker-password=$DOCKER_PASS \
+                                    --docker-email=test@example.com \
+                                    --dry-run=client -o yaml | kubectl apply -f -
+                                
+                                echo "✅ Docker registry secret created"
+                            """
+                        }
+                    }
                 }
             }
         }
@@ -197,8 +181,8 @@ pipeline {
                     withAWS(credentials: 'aws-creds', region: 'us-east-1') {
                         sh """
                             aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
-                            echo "🌐 LoadBalancer URL:"
-                            kubectl get svc nodejs-app -o jsonpath="{.status.loadBalancer.ingress[0].hostname}" || echo "LoadBalancer not ready yet"
+                            echo "🌐 Application URL:"
+                            kubectl get svc nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer not ready yet"
                         """
                     }
                 }
@@ -209,6 +193,13 @@ pipeline {
     post {
         success {
             echo '🎉 Pipeline completed successfully!'
+            script {
+                echo "🚀 Your complete CI/CD pipeline has built everything from scratch!"
+                echo "✅ Docker image built and pushed"
+                echo "✅ EKS cluster created"
+                echo "✅ Nodegroup created" 
+                echo "✅ Application deployed to Kubernetes"
+            }
         }
         failure {
             echo '❌ Pipeline failed!'
