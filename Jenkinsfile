@@ -64,6 +64,38 @@ pipeline {
             }
         }
         
+        stage('Force Cleanup Existing Stacks') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                    script {
+                        echo "🧹 Force cleaning up any existing CloudFormation stacks..."
+                        sh """
+                            # Delete any existing stacks
+                            aws cloudformation delete-stack --stack-name eksctl-nodejs-eks-cluster-nodegroup-workers --region $AWS_REGION 2>/dev/null || true
+                            aws cloudformation delete-stack --stack-name eksctl-nodejs-eks-cluster-cluster --region $AWS_REGION 2>/dev/null || true
+                            
+                            # Wait for deletions
+                            sleep 30
+                            
+                            # Force delete using eksctl if needed
+                            eksctl delete cluster --region $AWS_REGION --name $EKS_CLUSTER_NAME --force --wait 2>/dev/null || true
+                            
+                            echo "✅ Cleanup completed"
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Wait for Cleanup') {
+            steps {
+                script {
+                    echo "⏳ Waiting for cleanup to complete..."
+                    sleep 60
+                }
+            }
+        }
+        
         stage('Create EKS Cluster') {
             options {
                 timeout(time: 45, unit: 'MINUTES')
@@ -73,12 +105,12 @@ pipeline {
                     script {
                         echo "🚀 Creating EKS cluster: $EKS_CLUSTER_NAME"
                         sh """
-                            # Create EKS cluster with nodegroup
+                            # Create EKS cluster with a different approach
                             eksctl create cluster \
                                 --name $EKS_CLUSTER_NAME \
                                 --region $AWS_REGION \
                                 --version 1.28 \
-                                --nodegroup-name workers \
+                                --nodegroup-name standard-workers \
                                 --node-type t3.medium \
                                 --nodes 2 \
                                 --nodes-min 1 \
@@ -86,7 +118,8 @@ pipeline {
                                 --managed \
                                 --asg-access \
                                 --full-ecr-access \
-                                --auto-kubeconfig
+                                --auto-kubeconfig \
+                                --verbose 4
                         """
                         echo "✅ EKS cluster created successfully"
                     }
