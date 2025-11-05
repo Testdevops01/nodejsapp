@@ -64,14 +64,49 @@ pipeline {
             }
         }
         
+        stage('Cleanup Existing EKS Stack') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                    script {
+                        // Check if CloudFormation stack exists but cluster doesn't
+                        def stackExists = sh(
+                            script: """
+                                aws cloudformation describe-stacks --stack-name eksctl-nodejs-eks-cluster-cluster --region $AWS_REGION > /dev/null 2>&1 && echo "exists" || echo "not_exists"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        def clusterExists = sh(
+                            script: """
+                                aws eks describe-cluster --name $EKS_CLUSTER_NAME --region $AWS_REGION > /dev/null 2>&1 && echo "exists" || echo "not_exists"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (stackExists == "exists" && clusterExists == "not_exists") {
+                            echo "🧹 Cleaning up orphaned CloudFormation stack..."
+                            sh """
+                                eksctl delete cluster --region $AWS_REGION --name $EKS_CLUSTER_NAME --wait
+                            """
+                            echo "✅ Orphaned stack cleaned up"
+                        } else if (clusterExists == "exists") {
+                            echo "✅ EKS cluster already exists - skipping creation"
+                            currentBuild.result = 'SUCCESS' // Don't fail if cluster exists
+                        } else {
+                            echo "✅ No cleanup needed"
+                        }
+                    }
+                }
+            }
+        }
+        
         stage('Create EKS Cluster if Not Exists') {
             options {
-                timeout(time: 45, unit: 'MINUTES')  // EKS creation can take 15-30 minutes
+                timeout(time: 45, unit: 'MINUTES')
             }
             steps {
                 withAWS(credentials: 'aws-creds', region: 'us-east-1') {
                     script {
-                        // Check if cluster exists
                         def clusterExists = sh(
                             script: """
                                 aws eks describe-cluster --name $EKS_CLUSTER_NAME --region $AWS_REGION > /dev/null 2>&1 && echo "exists" || echo "not_exists"
@@ -82,20 +117,19 @@ pipeline {
                         if (clusterExists == "not_exists") {
                             echo "🚀 Creating EKS cluster: $EKS_CLUSTER_NAME"
                             sh """
+                                # Use simpler cluster creation with explicit auto-mode disable
                                 eksctl create cluster \
                                     --name $EKS_CLUSTER_NAME \
                                     --region $AWS_REGION \
+                                    --version 1.28 \
                                     --nodegroup-name workers \
                                     --node-type t3.medium \
                                     --nodes 2 \
                                     --nodes-min 1 \
                                     --nodes-max 3 \
                                     --managed \
-                                    --external-dns-access \
-                                    --full-ecr-access \
-                                    --appmesh-access \
-                                    --alb-ingress-access \
-                                    --auto-kubeconfig
+                                    --auto-kubeconfig \
+                                    --verbose 4
                             """
                             echo "✅ EKS cluster created successfully"
                         } else {
@@ -113,6 +147,10 @@ pipeline {
                         echo "🔧 Updating kubeconfig..."
                         aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
                         echo "✅ kubeconfig updated"
+                        
+                        # Verify cluster access
+                        kubectl cluster-info
+                        kubectl get nodes
                     """
                 }
             }
