@@ -1,269 +1,241 @@
 pipeline {
     agent any
-
     environment {
-        AWS_CREDENTIALS_ID = 'aws-jenkins-creds'
-        REGION = 'us-east-1'
-        CLUSTER_NAME = 'jenkins-eks-cluster'
-        ECR_REPO = 'my-eks-app'
-        IMAGE_TAG = ''
-        NAMESPACE = 'default'
+        AWS_ACCOUNT_ID = credentials('aws-account-id')
+        AWS_ACCESS_KEY_ID = credentials('aws-access-key')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+        DOCKER_REGISTRY = 'anusha987'
+        APP_NAME = 'nodejsapp-9.0'
+        EKS_CLUSTER_NAME = 'nodejs-app-cluster'
+        AWS_REGION = 'us-west-2'
+        GIT_REPO = 'https://github.com/Testdevops01/nodejsapp'
     }
-
     stages {
-        stage('Checkout Code') {
+        stage('Checkout') {
             steps {
-                checkout scm
+                git branch: 'main', url: "${GIT_REPO}"
             }
         }
-
-        stage('Setup Environment') {
+        
+        stage('Create Application Files') {
             steps {
-                script {
-                    // Get short commit hash for image tagging
-                    shortCommit = sh(
-                        returnStdout: true, 
-                        script: "git rev-parse --short HEAD"
-                    ).trim()
-                    env.IMAGE_TAG = "${shortCommit}-${env.BUILD_NUMBER}"
-                    
-                    // Create unique build ID - FIXED: Use proper string interpolation
-                    env.BUILD_ID = sh(
-                        returnStdout: true, 
-                        script: "echo ${env.BUILD_NUMBER}-\\$(date +%Y%m%d-%H%M%S)"
-                    ).trim()
+                sh '''
+                mkdir -p nodejs-app
+                cat > nodejs-app/package.json << 'EOF'
+                {
+                    "name": "docker_web_app",
+                    "version": "1.0.0",
+                    "description": "Node.js on Docker",
+                    "author": "First Last <first.last@example.com>",
+                    "main": "server.js",
+                    "scripts": {
+                      "start": "node server.js"
+                    },
+                    "dependencies": {
+                      "express": "^4.16.1"
+                    }
                 }
-                echo "Build ID: ${env.BUILD_ID}"
-                echo "Image Tag: ${env.IMAGE_TAG}"
+                EOF
+                
+                cat > nodejs-app/server.js << 'EOF'
+                'use strict';
+                
+                const express = require('express');
+                
+                // Constants
+                const PORT = 3000;
+                const HOST = '0.0.0.0';
+                
+                // App
+                const app = express();
+                app.get('/', (req, res) => {
+                  res.send('Hello World');
+                });
+                
+                app.listen(PORT, HOST);
+                console.log(\`Running on http://\${HOST}:\${PORT}\`);
+                EOF
+                
+                cat > nodejs-app/Dockerfile << 'EOF'
+                FROM node:14-alpine
+                WORKDIR /usr/src/app
+                COPY package*.json ./
+                RUN npm install
+                COPY . .
+                EXPOSE 3000
+                CMD [ "node", "server.js" ]
+                EOF
+                '''
             }
         }
-
-        stage('Install Prerequisites') {
+        
+        stage('Setup AWS CLI and EKSCTL') {
             steps {
-                script {
-                    // Install eksctl if not present
-                    sh '''
-                        if ! command -v eksctl >/dev/null 2>&1; then
-                            echo "Installing eksctl..."
-                            curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz"
-                            tar -xzf eksctl_$(uname -s)_amd64.tar.gz -C /tmp
-                            sudo mv /tmp/eksctl /usr/local/bin/
-                            eksctl version
-                        else
-                            echo "eksctl already installed"
-                        fi
-
-                        # Install kubectl if not present
-                        if ! command -v kubectl >/dev/null 2>&1; then
-                            echo "Installing kubectl..."
-                            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-                            sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-                            kubectl version --client
-                        else
-                            echo "kubectl already installed"
-                        fi
-                    '''
-                }
+                sh '''
+                # Install AWS CLI
+                curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                unzip awscliv2.zip
+                sudo ./aws/install
+                
+                # Install eksctl
+                curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+                sudo mv /tmp/eksctl /usr/local/bin
+                
+                # Install kubectl
+                curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+                
+                # Configure AWS CLI
+                aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+                aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+                aws configure set default.region ${AWS_REGION}
+                '''
             }
         }
-
+        
         stage('Create EKS Cluster') {
             steps {
-                withCredentials([[
-                    $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: "${AWS_CREDENTIALS_ID}",
-                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-                ]]) {
-                    script {
-                        sh """
-                            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-                            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-                            export AWS_DEFAULT_REGION=${REGION}
-
-                            echo "Checking if EKS cluster ${CLUSTER_NAME} exists..."
-                            
-                            # Check cluster status with timeout
-                            if ! timeout 30s eksctl get cluster --name ${CLUSTER_NAME} --region ${REGION} >/dev/null 2>&1; then
-                                echo "🔄 Creating EKS cluster ${CLUSTER_NAME}..."
-                                eksctl create cluster \\
-                                    --name ${CLUSTER_NAME} \\
-                                    --region ${REGION} \\
-                                    --nodegroup-name workers \\
-                                    --node-type t3.medium \\
-                                    --nodes 2 \\
-                                    --nodes-min 1 \\
-                                    --nodes-max 3 \\
-                                    --managed \\
-                                    --version 1.28 \\
-                                    --asg-access \\
-                                    --full-ecr-access \\
-                                    --verbose 4
-                                
-                                echo "✅ Cluster created successfully"
-                            else
-                                echo "✅ EKS cluster ${CLUSTER_NAME} already exists"
-                                
-                                # Verify cluster is active
-                                CLUSTER_STATUS=\\$(aws eks describe-cluster --name ${CLUSTER_NAME} --query 'cluster.status' --output text)
-                                echo "Cluster status: \\${CLUSTER_STATUS}"
-                            fi
-                        """
-                    }
-                }
+                sh """
+                # Create EKS cluster configuration
+                cat > eks-cluster.yaml << EOF
+                apiVersion: eksctl.io/v1alpha5
+                kind: ClusterConfig
+                metadata:
+                  name: ${EKS_CLUSTER_NAME}
+                  region: ${AWS_REGION}
+                  version: "1.28"
+                nodeGroups:
+                  - name: ng-1
+                    instanceType: t3.medium
+                    desiredCapacity: 2
+                    minSize: 1
+                    maxSize: 3
+                    volumeSize: 20
+                    ssh:
+                      allow: true
+                EOF
+                
+                # Create EKS cluster
+                eksctl create cluster -f eks-cluster.yaml
+                
+                # Update kubeconfig
+                aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+                """
             }
         }
-
-        stage('Build and Push to ECR') {
+        
+        stage('Build Docker Image') {
             steps {
-                withCredentials([[
-                    $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: "${AWS_CREDENTIALS_ID}",
-                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-                ]]) {
-                    script {
-                        sh """
-                            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-                            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-                            export AWS_DEFAULT_REGION=${REGION}
-
-                            # Get account ID
-                            ACCOUNT_ID=\\$(aws sts get-caller-identity --query Account --output text)
-                            REPO_URI="\\$ACCOUNT_ID.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}"
-                            
-                            echo "Using ECR repository: \\$REPO_URI"
-
-                            # Create ECR repo if not exists
-                            if ! aws ecr describe-repositories --repository-names ${ECR_REPO} >/dev/null 2>&1; then
-                                echo "Creating ECR repository ${ECR_REPO}"
-                                aws ecr create-repository --repository-name ${ECR_REPO}
-                                sleep 10
-                            fi
-
-                            # Login to ECR
-                            aws ecr get-login-password --region ${REGION} | \\
-                                docker login --username AWS --password-stdin \\$ACCOUNT_ID.dkr.ecr.${REGION}.amazonaws.com
-
-                            # Build and push image
-                            echo "Building Docker image..."
-                            docker build -t ${ECR_REPO}:${IMAGE_TAG} .
-                            
-                            echo "Tagging image..."
-                            docker tag ${ECR_REPO}:${IMAGE_TAG} \\$REPO_URI:${IMAGE_TAG}
-                            docker tag ${ECR_REPO}:${IMAGE_TAG} \\$REPO_URI:latest
-                            
-                            echo "Pushing image to ECR..."
-                            docker push \\$REPO_URI:${IMAGE_TAG}
-                            docker push \\$REPO_URI:latest
-
-                            # Save image URI
-                            echo "ECR_IMAGE=\\$REPO_URI:${IMAGE_TAG}" > ecr.env
-                            echo "LATEST_IMAGE=\\$REPO_URI:latest" >> ecr.env
-                        """
-                        
-                        // Read image URI back into environment
-                        env.ECR_IMAGE = sh(
-                            script: "grep ECR_IMAGE ecr.env | cut -d'=' -f2", 
-                            returnStdout: true
-                        ).trim()
-                        echo "✅ Image pushed: ${env.ECR_IMAGE}"
-                    }
-                }
+                sh """
+                cd nodejs-app
+                docker build -t ${DOCKER_REGISTRY}/${APP_NAME}:latest .
+                """
             }
         }
-
+        
+        stage('Push Docker Image') {
+            steps {
+                sh """
+                # Login to Docker Hub (or your preferred registry)
+                docker login -u ${DOCKER_REGISTRY} -p ${env.DOCKERHUB_CREDENTIALS}
+                
+                # Push image
+                docker push ${DOCKER_REGISTRY}/${APP_NAME}:latest
+                """
+            }
+        }
+        
         stage('Deploy to EKS') {
             steps {
-                withCredentials([[
-                    $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: "${AWS_CREDENTIALS_ID}",
-                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-                ]]) {
-                    script {
-                        sh """
-                            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-                            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-                            export AWS_DEFAULT_REGION=${REGION}
-
-                            echo "Configuring kubectl for EKS cluster..."
-                            aws eks update-kubeconfig --region ${REGION} --name ${CLUSTER_NAME}
-
-                            # Verify cluster access
-                            kubectl cluster-info
-                            kubectl get nodes
-
-                            # Create namespace if it doesn't exist
-                            if ! kubectl get namespace ${NAMESPACE} >/dev/null 2>&1; then
-                                kubectl create namespace ${NAMESPACE}
-                            fi
-
-                            echo "Generating Kubernetes manifests..."
-                            mkdir -p k8s/generated
-                            
-                            # Generate deployment.yaml from template
-                            sed "s|__IMAGE_PLACEHOLDER__|${ECR_IMAGE}|g" k8s/deployment.yaml.tpl > k8s/generated/deployment.yaml
-                            
-                            # Apply all manifests
-                            echo "Deploying application..."
-                            kubectl apply -f k8s/generated/ -n ${NAMESPACE}
-                            
-                            # Wait for rollout
-                            echo "Waiting for deployment to complete..."
-                            kubectl rollout status deployment/my-app -n ${NAMESPACE} --timeout=300s
-                            
-                            # Get deployment info
-                            kubectl get deployments,services,pods -n ${NAMESPACE}
-                        """
-                    }
-                }
+                sh """
+                # Create Kubernetes deployment manifest
+                cat > k8s-deployment.yaml << EOF
+                ---
+                kind: Deployment
+                apiVersion: apps/v1
+                metadata:
+                  name: nodejs-app
+                  namespace: default
+                  labels:
+                    app: nodejs-app
+                spec:
+                  replicas: 2
+                  selector:
+                    matchLabels:
+                      app: nodejs-app
+                  template:
+                    metadata:
+                      labels:
+                        app: nodejs-app
+                    spec:
+                      containers:
+                      - name: nodejs-app
+                        image: "${DOCKER_REGISTRY}/${APP_NAME}:latest"
+                        ports:
+                          - containerPort: 3000
+                        resources:
+                          requests:
+                            memory: "128Mi"
+                            cpu: "100m"
+                          limits:
+                            memory: "256Mi"
+                            cpu: "200m"
+                ---
+                apiVersion: v1
+                kind: Service
+                metadata:
+                  name: nodejs-app
+                  namespace: default
+                spec:
+                  selector:
+                    app: nodejs-app
+                  type: LoadBalancer
+                  ports:
+                  - name: http
+                    targetPort: 3000
+                    port: 80
+                EOF
+                
+                # Deploy to EKS
+                kubectl apply -f k8s-deployment.yaml
+                
+                # Wait for deployment to be ready
+                kubectl rollout status deployment/nodejs-app --timeout=300s
+                """
             }
         }
-
-        stage('Smoke Test') {
+        
+        stage('Verify Deployment') {
             steps {
-                script {
-                    sh """
-                        # Wait a bit for service to be ready
-                        sleep 30
-                        
-                        # Get service URL for testing
-                        SERVICE_URL=\\$(kubectl get service my-app-service -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-                        
-                        if [ -n "\\$SERVICE_URL" ]; then
-                            echo "Service URL: http://\\$SERVICE_URL"
-                            echo "Running smoke test..."
-                            # Add your smoke test commands here
-                            # curl -f http://\\$SERVICE_URL/health || exit 1
-                        else
-                            echo "Service not exposed via LoadBalancer"
-                        fi
-                    """
-                }
+                sh """
+                # Check pods
+                kubectl get pods
+                
+                # Check services
+                kubectl get svc
+                
+                # Check deployment
+                kubectl get deployment nodejs-app
+                """
             }
         }
     }
-
+    
     post {
         always {
-            echo "Pipeline execution completed"
-            script {
-                // Save deployment information
-                sh """
-                    echo "Build: ${env.BUILD_ID}" > build-info.txt
-                    echo "Image: ${env.ECR_IMAGE}" >> build-info.txt
-                    echo "Cluster: ${env.CLUSTER_NAME}" >> build-info.txt
-                    echo "Timestamp: \\$(date)" >> build-info.txt
-                """
-                archiveArtifacts artifacts: 'build-info.txt', fingerprint: true
-            }
+            echo 'Pipeline execution completed'
+            // Cleanup workspace if needed
+            // deleteDir()
         }
         success {
-            echo "✅ Pipeline executed successfully!"
+            echo 'Application deployed successfully to EKS!'
+            sh '''
+            # Get LoadBalancer URL
+            kubectl get svc nodejs-app -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"
+            '''
         }
         failure {
-            echo "❌ Pipeline failed!"
+            echo 'Pipeline failed!'
         }
     }
 }
