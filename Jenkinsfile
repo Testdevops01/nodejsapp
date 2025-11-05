@@ -68,7 +68,51 @@ pipeline {
                 }
             }
         }
-        
+       
+
+	stage('Create EKS Cluster if Not Exists') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                    script {
+                        // Check if cluster exists
+                        def clusterExists = sh(
+                            script: """
+                                aws eks describe-cluster --name $EKS_CLUSTER_NAME --region $AWS_REGION > /dev/null 2>&1 && echo "exists" || echo "not_exists"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (clusterExists == "not_exists") {
+                            echo "🚀 Creating EKS cluster: $EKS_CLUSTER_NAME"
+                            sh """
+                                eksctl create cluster \
+                                    --name $EKS_CLUSTER_NAME \
+                                    --region $AWS_REGION \
+                                    --nodegroup-name workers \
+                                    --node-type t3.medium \
+                                    --nodes 2 \
+                                    --nodes-min 1 \
+                                    --nodes-max 3 \
+                                    --managed \
+                                    --ssh-access \
+                                    --ssh-public-key jenkins-key \
+                                    --external-dns-access \
+                                    --full-ecr-access \
+                                    --appmesh-access \
+                                    --alb-ingress-access \
+                                    --auto-kubeconfig
+                            """
+                            echo "✅ EKS cluster created successfully"
+                        } else {
+                            echo "✅ EKS cluster already exists - skipping creation"
+                        }
+                    }
+                }
+            }
+        }
+
+
+	 
         stage('Configure EKS Access') {
             steps {
                 withAWS(credentials: 'aws-creds', region: 'us-east-1') {
