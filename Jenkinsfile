@@ -6,7 +6,7 @@ pipeline {
         AWS_ACCOUNT_ID = '843559766730'
         AWS_REGION = 'us-east-1'
         ECR_REPO_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/my-app"
-        EKS_CLUSTER_NAME = 'your-eks-cluster-name'  // ⚠️ REPLACE WITH ACTUAL CLUSTER NAME
+        EKS_CLUSTER_NAME = 'demo-cluster'
         
         // Application Configuration
         APP_NAME = 'my-app'
