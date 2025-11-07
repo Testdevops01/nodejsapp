@@ -4,7 +4,7 @@ pipeline {
     environment {
         DOCKER_REGISTRY = 'anusha987'
         APP_NAME = 'nodejsapp'
-        EKS_CLUSTER_NAME = 'nodejs-eks-cluster'
+        EKS_CLUSTER_NAME = 'nodejs-eks-cluster-dev'
         AWS_REGION = 'us-east-1'
         K8S_NAMESPACE = 'default'
     }
