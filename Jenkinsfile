@@ -6,74 +6,37 @@ pipeline {
         AWS_ACCOUNT_ID = '843559766730'
         AWS_REGION = 'us-east-1'
         ECR_REPO_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/my-app"
-        EKS_CLUSTER_NAME = 'demo-cluster'
+        EKS_CLUSTER_NAME = 'eks-demo'  // Your actual cluster name
         
         // Application Configuration
         APP_NAME = 'my-app'
         K8S_NAMESPACE = 'default'
         DOCKER_IMAGE = "${ECR_REPO_URI}:${BUILD_NUMBER}"
+        DEPLOY_ENVIRONMENT = 'dev'  // Hardcoded to dev for learning
     }
     
     options {
         buildDiscarder(logRotator(numToKeepStr: '10'))
         timeout(time: 30, unit: 'MINUTES')
-        disableConcurrentBuilds()
-    }
-    
-    parameters {
-        choice(
-            name: 'DEPLOY_ENVIRONMENT',
-            choices: ['dev', 'staging', 'production'],
-            description: 'Select deployment environment'
-        )
-        booleanParam(
-            name: 'RUN_TESTS',
-            defaultValue: true,
-            description: 'Run tests before deployment'
-        )
     }
     
     stages {
         stage('Checkout Code') {
             steps {
                 checkout scm
-                script {
-                    echo "Building commit: ${GIT_COMMIT}"
-                    echo "Branch: ${GIT_BRANCH}"
-                }
             }
         }
         
         stage('Install Dependencies') {
             steps {
-                sh """
-                    echo "Installing Node.js dependencies..."
-                    npm install
-                """
-            }
-        }
-        
-        stage('Run Tests') {
-            when {
-                expression { params.RUN_TESTS == true }
-            }
-            steps {
-                sh """
-                    echo "Running tests..."
-                    npm test
-                """
-            }
-            post {
-                always {
-                    junit 'reports/**/*.xml'
-                }
+                sh 'npm install'
             }
         }
         
         stage('Build Docker Image') {
             steps {
                 script {
-                    echo "Building Docker image: ${DOCKER_IMAGE}"
+                    echo "Building Docker image for ${DEPLOY_ENVIRONMENT}: ${DOCKER_IMAGE}"
                     sh """
                         docker build -t ${DOCKER_IMAGE} .
                         docker tag ${DOCKER_IMAGE} ${ECR_REPO_URI}:latest
@@ -82,32 +45,21 @@ pipeline {
             }
         }
         
-        stage('Security Scan') {
-            steps {
-                script {
-                    echo "Running security scan..."
-                    // Uncomment if you have security scanners
-                    // sh "trivy image ${DOCKER_IMAGE}"
-                }
-            }
-        }
-        
         stage('Push to ECR') {
             steps {
                 script {
-                    echo "Logging into ECR using IAM Role..."
+                    echo "Pushing to ECR using IAM Role..."
                     sh """
-                        aws ecr get-login-password --region ${AWS_REGION} | \
+                        # Login to ECR using IAM Role
+                        aws ecr get-login-password --region ${AWS_REGION} | \\
                         docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-                    """
-                    
-                    echo "Pushing images to ECR..."
-                    sh """
+                        
+                        # Push images
                         docker push ${DOCKER_IMAGE}
                         docker push ${ECR_REPO_URI}:latest
+                        
+                        echo "✅ Images pushed successfully!"
                     """
-                    
-                    echo "✅ Images pushed successfully!"
                 }
             }
         }
@@ -115,12 +67,12 @@ pipeline {
         stage('Verify ECR Push') {
             steps {
                 script {
-                    echo "Verifying images in ECR..."
+                    echo "Verifying ECR push..."
                     sh """
-                        aws ecr list-images \
-                            --repository-name my-app \
-                            --region ${AWS_REGION} \
-                            --query 'imageIds[].imageTag' \
+                        aws ecr list-images \\
+                            --repository-name my-app \\
+                            --region ${AWS_REGION} \\
+                            --query 'imageIds[].imageTag' \\
                             --output table
                     """
                 }
@@ -128,59 +80,44 @@ pipeline {
         }
         
         stage('Deploy to EKS') {
-            when {
-                expression { 
-                    params.DEPLOY_ENVIRONMENT != null && 
-                    env.EKS_CLUSTER_NAME != 'your-eks-cluster-name' 
-                }
-            }
             steps {
                 script {
-                    echo "Deploying to ${params.DEPLOY_ENVIRONMENT} environment..."
-                    
-                    // Configure kubectl for EKS cluster
+                    echo "Deploying to EKS: ${EKS_CLUSTER_NAME}"
                     sh """
-                        aws eks update-kubeconfig \
-                            --region ${AWS_REGION} \
-                            --name ${EKS_CLUSTER_NAME}
-                    """
-                    
-                    // Create namespace if it doesn't exist
-                    sh """
+                        # Configure kubectl for EKS
+                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+                        
+                        # Create namespace if it doesn't exist
                         kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Update or create deployment
+                        kubectl set image deployment/${APP_NAME} ${APP_NAME}=${DOCKER_IMAGE} -n ${K8S_NAMESPACE} --record || \\
+                        kubectl create deployment ${APP_NAME} --image=${DOCKER_IMAGE} -n ${K8S_NAMESPACE}
+                        
+                        # Wait for rollout
+                        kubectl rollout status deployment/${APP_NAME} -n ${K8S_NAMESPACE} --timeout=300s
+                        
+                        echo "✅ Deployment completed to ${DEPLOY_ENVIRONMENT}!"
                     """
-                    
-                    // Deploy application
-                    sh """
-                        kubectl set image deployment/${APP_NAME} \
-                            ${APP_NAME}=${DOCKER_IMAGE} \
-                            -n ${K8S_NAMESPACE} \
-                            --record
-                    """
-                    
-                    // Wait for rollout to complete
-                    sh """
-                        kubectl rollout status deployment/${APP_NAME} \
-                            -n ${K8S_NAMESPACE} \
-                            --timeout=600s
-                    """
-                    
-                    echo "✅ Deployment completed successfully!"
                 }
             }
         }
         
-        stage('Smoke Test') {
-            when {
-                expression { params.DEPLOY_ENVIRONMENT != null }
-            }
+        stage('Verify Deployment') {
             steps {
                 script {
-                    echo "Running smoke tests..."
-                    // Add your smoke test commands here
+                    echo "Verifying deployment..."
                     sh """
-                        echo "Smoke tests would run here..."
-                        kubectl get svc ${APP_NAME}-service -n ${K8S_NAMESPACE} || echo "No service found"
+                        echo "=== Deployment Status ==="
+                        kubectl get deployments -n ${K8S_NAMESPACE}
+                        
+                        echo ""
+                        echo "=== Pods Status ==="
+                        kubectl get pods -n ${K8S_NAMESPACE} | grep ${APP_NAME} || echo "No pods found yet"
+                        
+                        echo ""
+                        echo "=== Services ==="
+                        kubectl get services -n ${K8S_NAMESPACE} | grep ${APP_NAME} || echo "No services found"
                     """
                 }
             }
@@ -191,40 +128,19 @@ pipeline {
         always {
             script {
                 echo "Pipeline execution completed: ${currentBuild.currentResult}"
-                // Clean up Docker images to save space
+                // Clean up Docker images
                 sh """
                     docker rmi ${DOCKER_IMAGE} || true
                     docker rmi ${ECR_REPO_URI}:latest || true
-                    docker system prune -f || true
                 """
             }
         }
         success {
-            script {
-                echo "🎉 SUCCESS! Pipeline completed using IAM Role - No AWS credentials stored!"
-                
-                // Send success notification (uncomment if needed)
-                /*
-                emailext (
-                    subject: "SUCCESS: ${env.JOB_NAME} [${env.BUILD_NUMBER}]",
-                    body: """
-                    Pipeline execution successful!
-                    
-                    Job: ${env.JOB_NAME}
-                    Build: ${env.BUILD_NUMBER}
-                    Environment: ${params.DEPLOY_ENVIRONMENT}
-                    Image: ${DOCKER_IMAGE}
-                    """,
-                    to: "devops@yourcompany.com"
-                )
-                */
-            }
+            echo "🎉 SUCCESS! Pipeline completed using IAM Role - No AWS credentials stored!"
+            echo "🚀 Application deployed to ${DEPLOY_ENVIRONMENT} environment"
         }
         failure {
-            script {
-                echo "❌ Pipeline failed!"
-                // Send failure notification if needed
-            }
+            echo "❌ Pipeline failed!"
         }
     }
 }

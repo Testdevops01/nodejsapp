@@ -3,11 +3,7 @@
   "version": "1.0.0",
   "scripts": {
     "start": "node app.js",
-    "test": "jest --coverage --testResultsProcessor=\"jest-junit\"",
     "dev": "nodemon app.js"
-  },
-  "devDependencies": {
-    "jest": "^29.0.0",
-    "jest-junit": "^15.0.0"
   }
 }
+
