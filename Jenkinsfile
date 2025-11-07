@@ -2,95 +2,51 @@ pipeline {
     agent any
     
     environment {
-        // AWS Configuration
         AWS_ACCOUNT_ID = '843559766730'
         AWS_REGION = 'us-east-1'
-        ECR_REPO_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/my-app"
-        
-        // EKS Cluster Configuration
         EKS_CLUSTER_NAME = 'jenkins-eks-demo'
-        EKS_CLUSTER_VERSION = '1.30'
-        
-        // Application Configuration
-        APP_NAME = 'my-app'
-        K8S_NAMESPACE = 'default'
-        DOCKER_IMAGE = "${ECR_REPO_URI}:${BUILD_NUMBER}"
-    }
-    
-    options {
-        buildDiscarder(logRotator(numToKeepStr: '10'))
-        timeout(time: 60, unit: 'MINUTES')  // Increased for EKS creation
     }
     
     stages {
         stage('Create EKS Cluster') {
             steps {
                 script {
-                    echo "🚀 Creating EKS cluster: ${EKS_CLUSTER_NAME}"
-                    
-                    // Get default VPC and subnets
-                    sh """
-                        # Get default VPC
-                        VPC_ID=\$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query "Vpcs[0].VpcId" --output text)
-                        echo "Using default VPC: \$VPC_ID"
+                    echo "Creating EKS cluster..."
+                    sh '''
+                        # Create cluster with default VPC and subnets
+                        aws eks create-cluster \
+                            --name jenkins-eks-demo \
+                            --version 1.30 \
+                            --region us-east-1 \
+                            --resources-vpc-config subnetIds=subnet-0774ed98cadbf8fba
                         
-                        # Get all subnets in the default VPC
-                        SUBNET_IDS=\$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=\$VPC_ID" --query "Subnets[*].SubnetId" --output text | tr '\\n' ',' | sed 's/,$//')
-                        echo "Using subnets: \$SUBNET_IDS"
-                        
-                        # Create EKS cluster
-                        aws eks create-cluster \\
-                            --name ${EKS_CLUSTER_NAME} \\
-                            --version ${EKS_CLUSTER_VERSION} \\
-                            --region ${AWS_REGION} \\
-                            --resources-vpc-config subnetIds="\$SUBNET_IDS"
-                        
-                        echo "✅ EKS cluster creation started!"
-                        echo "⏳ This will take 10-15 minutes..."
-                    """
+                        echo "Cluster creation started - wait 15 minutes"
+                    '''
                 }
             }
         }
         
-        stage('Wait for EKS Cluster') {
+        stage('Wait for Cluster') {
             steps {
                 script {
-                    echo "⏳ Waiting for EKS cluster to become active..."
-                    sh """
-                        # Wait for cluster with timeout (20 minutes)
-                        TIMEOUT=1200
-                        INTERVAL=30
-                        ELAPSED=0
-                        CLUSTER_ACTIVE=false
-                        
-                        while [ \$ELAPSED -lt \$TIMEOUT ]; do
-                            STATUS=\$(aws eks describe-cluster --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION} --query "cluster.status" --output text 2>/dev/null || echo "CREATING")
-                            
-                            echo "Cluster status: \$STATUS"
-                            
-                            if [ "\$STATUS" = "ACTIVE" ]; then
-                                echo "🎉 EKS cluster is now ACTIVE!"
-                                CLUSTER_ACTIVE=true
+                    echo "Waiting for cluster..."
+                    sh '''
+                        # Simple wait loop
+                        for i in {1..30}; do
+                            STATUS=$(aws eks describe-cluster --name jenkins-eks-demo --region us-east-1 --query "cluster.status" --output text 2>/dev/null || echo "CREATING")
+                            echo "Status: $STATUS"
+                            if [ "$STATUS" = "ACTIVE" ]; then
+                                echo "Cluster ready!"
                                 break
-                            elif [ "\$STATUS" = "FAILED" ]; then
-                                echo "❌ EKS cluster creation FAILED"
-                                echo "Check AWS Console for details"
-                                exit 1
-                            else
-                                echo "Still creating... (\$ELAPSED seconds elapsed)"
-                                sleep \$INTERVAL
-                                ELAPSED=\$((ELAPSED + INTERVAL))
                             fi
+                            sleep 30
                         done
-                        
-                        if [ "\$CLUSTER_ACTIVE" = "false" ]; then
-                            echo "❌ Timeout waiting for EKS cluster after 20 minutes"
-                            exit 1
-                        fi
-                    """
+                    '''
                 }
             }
         }
+    }
+}
         
         stage('Configure kubectl') {
             steps {
