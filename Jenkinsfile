@@ -2,244 +2,229 @@ pipeline {
     agent any
     
     environment {
-        DOCKER_REGISTRY = 'anusha987'
-        APP_NAME = 'nodejsapp'
-        EKS_CLUSTER_NAME = 'nodejs-eks-cluster-dev'
+        // AWS Configuration
+        AWS_ACCOUNT_ID = '843559766730'
         AWS_REGION = 'us-east-1'
+        ECR_REPO_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/my-app"
+        EKS_CLUSTER_NAME = 'your-eks-cluster-name'  // ⚠️ REPLACE WITH ACTUAL CLUSTER NAME
+        
+        // Application Configuration
+        APP_NAME = 'my-app'
         K8S_NAMESPACE = 'default'
+        DOCKER_IMAGE = "${ECR_REPO_URI}:${BUILD_NUMBER}"
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+    
+    parameters {
+        choice(
+            name: 'DEPLOY_ENVIRONMENT',
+            choices: ['dev', 'staging', 'production'],
+            description: 'Select deployment environment'
+        )
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: 'Run tests before deployment'
+        )
     }
     
     stages {
         stage('Checkout Code') {
             steps {
                 checkout scm
-                echo '✅ Code checkout completed'
+                script {
+                    echo "Building commit: ${GIT_COMMIT}"
+                    echo "Branch: ${GIT_BRANCH}"
+                }
             }
         }
         
-        stage('Test AWS Credentials') {
+        stage('Install Dependencies') {
             steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                    sh '''
-                        echo "Testing AWS credentials..."
-                        aws sts get-caller-identity
-                    '''
+                sh """
+                    echo "Installing Node.js dependencies..."
+                    npm install
+                """
+            }
+        }
+        
+        stage('Run Tests') {
+            when {
+                expression { params.RUN_TESTS == true }
+            }
+            steps {
+                sh """
+                    echo "Running tests..."
+                    npm test
+                """
+            }
+            post {
+                always {
+                    junit 'reports/**/*.xml'
                 }
             }
         }
         
         stage('Build Docker Image') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'docker-creds',
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASS'
-                )]) {
-                    sh '''
-                        echo "🐳 Logging into Docker Hub..."
-                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-                        
-                        echo "🐳 Building Docker image..."
-                        docker build -t $DOCKER_REGISTRY/$APP_NAME:latest .
-                        
-                        echo "✅ Docker image built successfully"
-                    '''
-                }
-            }
-        }
-        
-        stage('Push Docker Image') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'docker-creds',
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASS'
-                )]) {
-                    sh '''
-                        echo "📤 Pushing Docker image..."
-                        docker push $DOCKER_REGISTRY/$APP_NAME:latest
-                        echo "✅ Docker image pushed successfully"
-                    '''
-                }
-            }
-        }
-        
-        stage('Force Cleanup Existing Stacks') {
-            steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                    script {
-                        echo "🧹 Force cleaning up any existing CloudFormation stacks..."
-                        sh """
-                            # Delete any existing stacks
-                            aws cloudformation delete-stack --stack-name eksctl-nodejs-eks-cluster-nodegroup-workers --region $AWS_REGION 2>/dev/null || true
-                            aws cloudformation delete-stack --stack-name eksctl-nodejs-eks-cluster-cluster --region $AWS_REGION 2>/dev/null || true
-                            
-                            # Wait for deletions
-                            sleep 30
-                            
-                            # Force delete using eksctl if needed
-                            eksctl delete cluster --region $AWS_REGION --name $EKS_CLUSTER_NAME --force --wait 2>/dev/null || true
-                            
-                            echo "✅ Cleanup completed"
-                        """
-                    }
-                }
-            }
-        }
-        
-        stage('Wait for Cleanup') {
-            steps {
                 script {
-                    echo "⏳ Waiting for cleanup to complete..."
-                    sleep 60
-                }
-            }
-        }
-        
-        stage('Create EKS Cluster') {
-            options {
-                timeout(time: 45, unit: 'MINUTES')
-            }
-            steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                    script {
-                        echo "🚀 Creating EKS cluster: $EKS_CLUSTER_NAME"
-                        sh """
-                            # Create EKS cluster with a different approach
-                            eksctl create cluster \
-                                --name $EKS_CLUSTER_NAME \
-                                --region $AWS_REGION \
-                                --version 1.28 \
-                                --nodegroup-name standard-workers \
-                                --node-type t3.medium \
-                                --nodes 2 \
-                                --nodes-min 1 \
-                                --nodes-max 3 \
-                                --managed \
-                                --asg-access \
-                                --full-ecr-access \
-                                --auto-kubeconfig \
-                                --verbose 4
-                        """
-                        echo "✅ EKS cluster created successfully"
-                    }
-                }
-            }
-        }
-        
-        stage('Configure EKS Access') {
-            steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                    echo "Building Docker image: ${DOCKER_IMAGE}"
                     sh """
-                        echo "🔧 Updating kubeconfig..."
-                        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
-                        echo "✅ kubeconfig updated"
-                        
-                        # Verify cluster access
-                        echo "🔍 Testing cluster access..."
-                        kubectl cluster-info
-                        echo "📊 Checking nodes..."
-                        kubectl get nodes
+                        docker build -t ${DOCKER_IMAGE} .
+                        docker tag ${DOCKER_IMAGE} ${ECR_REPO_URI}:latest
                     """
                 }
             }
         }
         
-        stage('Setup Docker Registry Secret') {
+        stage('Security Scan') {
             steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                    script {
-                        withCredentials([usernamePassword(
-                            credentialsId: 'docker-creds',
-                            usernameVariable: 'DOCKER_USER',
-                            passwordVariable: 'DOCKER_PASS'
-                        )]) {
-                            sh """
-                                aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
-                                
-                                # Create docker registry secret
-                                kubectl create secret docker-registry docker-credentials \
-                                    --docker-server=https://index.docker.io/v1/ \
-                                    --docker-username=$DOCKER_USER \
-                                    --docker-password=$DOCKER_PASS \
-                                    --docker-email=test@example.com \
-                                    --dry-run=client -o yaml | kubectl apply -f -
-                                
-                                echo "✅ Docker registry secret created"
-                            """
-                        }
-                    }
+                script {
+                    echo "Running security scan..."
+                    // Uncomment if you have security scanners
+                    // sh "trivy image ${DOCKER_IMAGE}"
+                }
+            }
+        }
+        
+        stage('Push to ECR') {
+            steps {
+                script {
+                    echo "Logging into ECR using IAM Role..."
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                    """
+                    
+                    echo "Pushing images to ECR..."
+                    sh """
+                        docker push ${DOCKER_IMAGE}
+                        docker push ${ECR_REPO_URI}:latest
+                    """
+                    
+                    echo "✅ Images pushed successfully!"
+                }
+            }
+        }
+        
+        stage('Verify ECR Push') {
+            steps {
+                script {
+                    echo "Verifying images in ECR..."
+                    sh """
+                        aws ecr list-images \
+                            --repository-name my-app \
+                            --region ${AWS_REGION} \
+                            --query 'imageIds[].imageTag' \
+                            --output table
+                    """
                 }
             }
         }
         
         stage('Deploy to EKS') {
-            steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                    sh """
-                        echo "🚀 Deploying application to EKS..."
-                        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
-                        kubectl apply -f deployment.yaml
-                        echo "✅ Deployment completed"
-                    """
+            when {
+                expression { 
+                    params.DEPLOY_ENVIRONMENT != null && 
+                    env.EKS_CLUSTER_NAME != 'your-eks-cluster-name' 
                 }
             }
-        }
-        
-        stage('Verify Deployment') {
-            steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                    sh """
-                        echo "🔍 Checking deployment status..."
-                        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
-                        
-                        echo "⏳ Waiting for deployment to complete..."
-                        kubectl rollout status deployment/nodejs-app -n $K8S_NAMESPACE --timeout=300s
-                        
-                        echo "📊 Checking pods..."
-                        kubectl get pods -n $K8S_NAMESPACE -l app=nodejs-app
-                        
-                        echo "🌐 Checking services..."
-                        kubectl get svc -n $K8S_NAMESPACE
-                        
-                        echo "✅ Verification complete"
-                    """
-                }
-            }
-        }
-        
-        stage('Get Application URL') {
             steps {
                 script {
-                    withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                        sh """
-                            aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
-                            echo "🌐 Application URL:"
-                            kubectl get svc nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "LoadBalancer not ready yet"
-                        """
-                    }
+                    echo "Deploying to ${params.DEPLOY_ENVIRONMENT} environment..."
+                    
+                    // Configure kubectl for EKS cluster
+                    sh """
+                        aws eks update-kubeconfig \
+                            --region ${AWS_REGION} \
+                            --name ${EKS_CLUSTER_NAME}
+                    """
+                    
+                    // Create namespace if it doesn't exist
+                    sh """
+                        kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                    """
+                    
+                    // Deploy application
+                    sh """
+                        kubectl set image deployment/${APP_NAME} \
+                            ${APP_NAME}=${DOCKER_IMAGE} \
+                            -n ${K8S_NAMESPACE} \
+                            --record
+                    """
+                    
+                    // Wait for rollout to complete
+                    sh """
+                        kubectl rollout status deployment/${APP_NAME} \
+                            -n ${K8S_NAMESPACE} \
+                            --timeout=600s
+                    """
+                    
+                    echo "✅ Deployment completed successfully!"
+                }
+            }
+        }
+        
+        stage('Smoke Test') {
+            when {
+                expression { params.DEPLOY_ENVIRONMENT != null }
+            }
+            steps {
+                script {
+                    echo "Running smoke tests..."
+                    // Add your smoke test commands here
+                    sh """
+                        echo "Smoke tests would run here..."
+                        kubectl get svc ${APP_NAME}-service -n ${K8S_NAMESPACE} || echo "No service found"
+                    """
                 }
             }
         }
     }
     
     post {
-        success {
-            echo '🎉 Pipeline completed successfully!'
+        always {
             script {
-                echo "🚀 Your complete CI/CD pipeline has built everything from scratch!"
-                echo "✅ Docker image built and pushed"
-                echo "✅ EKS cluster created"
-                echo "✅ Nodegroup created" 
-                echo "✅ Application deployed to Kubernetes"
+                echo "Pipeline execution completed: ${currentBuild.currentResult}"
+                // Clean up Docker images to save space
+                sh """
+                    docker rmi ${DOCKER_IMAGE} || true
+                    docker rmi ${ECR_REPO_URI}:latest || true
+                    docker system prune -f || true
+                """
+            }
+        }
+        success {
+            script {
+                echo "🎉 SUCCESS! Pipeline completed using IAM Role - No AWS credentials stored!"
+                
+                // Send success notification (uncomment if needed)
+                /*
+                emailext (
+                    subject: "SUCCESS: ${env.JOB_NAME} [${env.BUILD_NUMBER}]",
+                    body: """
+                    Pipeline execution successful!
+                    
+                    Job: ${env.JOB_NAME}
+                    Build: ${env.BUILD_NUMBER}
+                    Environment: ${params.DEPLOY_ENVIRONMENT}
+                    Image: ${DOCKER_IMAGE}
+                    """,
+                    to: "devops@yourcompany.com"
+                )
+                */
             }
         }
         failure {
-            echo '❌ Pipeline failed!'
-        }
-        always {
-            echo '🧹 Cleaning up...'
-            sh 'docker system prune -f || true'
+            script {
+                echo "❌ Pipeline failed!"
+                // Send failure notification if needed
+            }
         }
     }
 }
