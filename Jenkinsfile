@@ -97,12 +97,14 @@ pipeline {
                 VPC_ID=\$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query "Vpcs[0].VpcId" --output text)
                 SUBNET_IDS=\$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=\$VPC_ID" --query "join(',', Subnets[0:2].SubnetId)" --output text)
 
+		echo "Using subnets: \$SUBNET_IDS"
+
                 aws eks create-nodegroup \\
                     --cluster-name ${EKS_CLUSTER_NAME} \\
                     --nodegroup-name workers \\
                     --instance-types t3.medium \\
                     --scaling-config minSize=1,maxSize=3,desiredSize=2 \\
-                    --subnets "\$SUBNET_IDS" \\
+                    --subnets   \$(echo "\$SUBNET_IDS" | tr ',' ' ') \\
                     --node-role arn:aws:iam::${AWS_ACCOUNT_ID}:role/EKSNodeInstanceRole \\
                     --region ${AWS_REGION}
 
