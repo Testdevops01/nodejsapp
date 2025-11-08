@@ -11,26 +11,31 @@ pipeline {
     }
 
     stages {
-        stage('Create EKS Cluster') {
+        stage('Create EKS Cluster with AWS CLI') {
             steps {
                 script {
                     echo "🚀 Creating EKS cluster: ${EKS_CLUSTER_NAME}"
                     sh """
-                        # Check if cluster exists using basic describe (should work)
+                        # Check if cluster already exists
                         if aws eks describe-cluster --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION} 2>/dev/null; then
                             echo "✅ Cluster ${EKS_CLUSTER_NAME} already exists"
                         else
-                            echo "Creating new EKS cluster..."
-                            # Use eksctl without specifying version (it will use default)
-                            eksctl create cluster \
-                                --name ${EKS_CLUSTER_NAME} \
-                                --region ${AWS_REGION} \
-                                --nodegroup-name workers \
-                                --node-type t3.medium \
-                                --nodes 2 \
-                                --nodes-min 1 \
-                                --nodes-max 3 \
-                                --managed
+                            echo "Creating new EKS cluster using AWS CLI..."
+                            
+                            # Get default VPC and subnets
+                            VPC_ID=\$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query "Vpcs[0].VpcId" --output text)
+                            echo "Using VPC: \$VPC_ID"
+                            
+                            SUBNET_IDS=\$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=\$VPC_ID" --query "Subnets[0:2].SubnetId" --output text | tr '\\n' ',' | sed 's/,\$//')
+                            echo "Using subnets: \$SUBNET_IDS"
+                            
+                            # Create EKS cluster
+                            aws eks create-cluster \\
+                                --name ${EKS_CLUSTER_NAME} \\
+                                --region ${AWS_REGION} \\
+                                --kubernetes-version 1.28 \\
+                                --role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/JenkinsWorkerRole \\
+                                --resources-vpc-config subnetIds="\$SUBNET_IDS"
                             
                             echo "✅ EKS cluster creation started (takes 10-15 minutes)"
                         fi
@@ -39,10 +44,10 @@ pipeline {
             }
         }
 
-        stage('Wait for Cluster Ready') {
+        stage('Wait for EKS Control Plane') {
             steps {
                 script {
-                    echo "⏳ Waiting for EKS cluster to be ready..."
+                    echo "⏳ Waiting for EKS control plane to be ready..."
                     sh """
                         TIMEOUT=1200
                         INTERVAL=30
@@ -52,20 +57,79 @@ pipeline {
                             STATUS=\$(aws eks describe-cluster --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION} --query "cluster.status" --output text 2>/dev/null || echo "CREATING")
                             
                             if [ "\$STATUS" = "ACTIVE" ]; then
-                                echo "🎉 EKS cluster is ACTIVE!"
+                                echo "🎉 EKS control plane is ACTIVE!"
                                 break
                             elif [ "\$STATUS" = "FAILED" ]; then
                                 echo "❌ Cluster creation failed"
                                 exit 1
                             else
-                                echo "Cluster status: \$STATUS (\$ELAPSED seconds)"
+                                echo "Control plane status: \$STATUS (\$ELAPSED seconds)"
                                 sleep \$INTERVAL
                                 ELAPSED=\$((ELAPSED + INTERVAL))
                             fi
                         done
                         
                         if [ "\$STATUS" != "ACTIVE" ]; then
-                            echo "❌ Timeout waiting for cluster"
+                            echo "❌ Timeout waiting for control plane"
+                            exit 1
+                        fi
+                    """
+                }
+            }
+        }
+
+        stage('Create EKS Node Group') {
+            steps {
+                script {
+                    echo "🖥️ Creating EKS Node Group..."
+                    sh """
+                        # Get subnets again
+                        VPC_ID=\$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query "Vpcs[0].VpcId" --output text)
+                        SUBNET_IDS=\$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=\$VPC_ID" --query "Subnets[0:2].SubnetId" --output text | tr '\\n' ',' | sed 's/,\$//')
+                        
+                        # Create node group
+                        aws eks create-nodegroup \\
+                            --cluster-name ${EKS_CLUSTER_NAME} \\
+                            --nodegroup-name workers \\
+                            --instance-types t3.medium \\
+                            --scaling-config minSize=1,maxSize=3,desiredSize=2 \\
+                            --subnets "\$SUBNET_IDS" \\
+                            --node-role arn:aws:iam::${AWS_ACCOUNT_ID}:role/JenkinsWorkerRole \\
+                            --region ${AWS_REGION}
+                        
+                        echo "✅ Node group creation started"
+                    """
+                }
+            }
+        }
+
+        stage('Wait for Node Group') {
+            steps {
+                script {
+                    echo "⏳ Waiting for node group to be ready..."
+                    sh """
+                        TIMEOUT=900
+                        INTERVAL=30
+                        ELAPSED=0
+                        
+                        while [ \$ELAPSED -lt \$TIMEOUT ]; do
+                            STATUS=\$(aws eks describe-nodegroup --cluster-name ${EKS_CLUSTER_NAME} --nodegroup-name workers --region ${AWS_REGION} --query "nodegroup.status" --output text 2>/dev/null || echo "CREATING")
+                            
+                            if [ "\$STATUS" = "ACTIVE" ]; then
+                                echo "🎉 Node group is ACTIVE!"
+                                break
+                            elif [ "\$STATUS" = "CREATE_FAILED" ]; then
+                                echo "❌ Node group creation failed"
+                                exit 1
+                            else
+                                echo "Node group status: \$STATUS (\$ELAPSED seconds)"
+                                sleep \$INTERVAL
+                                ELAPSED=\$((ELAPSED + INTERVAL))
+                            fi
+                        done
+                        
+                        if [ "\$STATUS" != "ACTIVE" ]; then
+                            echo "❌ Timeout waiting for node group"
                             exit 1
                         fi
                     """
@@ -78,8 +142,8 @@ pipeline {
                 script {
                     echo "🔧 Configuring kubectl access..."
                     sh """
-                        aws eks update-kubeconfig \
-                            --region ${AWS_REGION} \
+                        aws eks update-kubeconfig \\
+                            --region ${AWS_REGION} \\
                             --name ${EKS_CLUSTER_NAME}
                         
                         # Verify cluster access
@@ -138,19 +202,16 @@ pipeline {
                 script {
                     echo "🚀 Deploying to EKS..."
                     sh """
-                        # Create deployment using kubectl (simpler approach)
+                        # Create deployment
                         kubectl create deployment ${APP_NAME} --image=${DOCKER_IMAGE} --dry-run=client -o yaml | kubectl apply -f -
                         
                         # Expose service
-                        kubectl expose deployment ${APP_NAME} \
-                            --port=80 \
-                            --target-port=3000 \
-                            --type=LoadBalancer \
-                            --name=${APP_NAME}-service \
+                        kubectl expose deployment ${APP_NAME} \\
+                            --port=80 \\
+                            --target-port=3000 \\
+                            --type=LoadBalancer \\
+                            --name=${APP_NAME}-service \\
                             --dry-run=client -o yaml | kubectl apply -f -
-                        
-                        # Scale deployment
-                        kubectl scale deployment/${APP_NAME} --replicas=2
                         
                         # Wait for rollout
                         kubectl rollout status deployment/${APP_NAME} --timeout=300s
