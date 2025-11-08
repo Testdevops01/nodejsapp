@@ -105,7 +105,7 @@ pipeline {
                             --instance-types t3.medium \\
                             --scaling-config minSize=1,maxSize=3,desiredSize=2 \\
                             --subnets "\$SUBNET_IDS" \\
-                            --node-role arn:aws:iam::${AWS_ACCOUNT_ID}:role/JenkinsWorkerRole \\
+                            --node-role arn:aws:iam::${AWS_ACCOUNT_ID}:role/EKSNodeInstanceRole \\
                             --region ${AWS_REGION}
                         
                         echo "✅ Node group creation started"
