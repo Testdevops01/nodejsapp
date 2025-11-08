@@ -16,22 +16,21 @@ pipeline {
                 script {
                     echo "🚀 Creating EKS cluster: ${EKS_CLUSTER_NAME}"
                     sh """
-                        # Check if cluster already exists
+                        # Check if cluster exists using basic describe (should work)
                         if aws eks describe-cluster --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION} 2>/dev/null; then
                             echo "✅ Cluster ${EKS_CLUSTER_NAME} already exists"
                         else
                             echo "Creating new EKS cluster..."
+                            # Use eksctl without specifying version (it will use default)
                             eksctl create cluster \
                                 --name ${EKS_CLUSTER_NAME} \
                                 --region ${AWS_REGION} \
-                                --version 1.30 \
                                 --nodegroup-name workers \
                                 --node-type t3.medium \
                                 --nodes 2 \
                                 --nodes-min 1 \
                                 --nodes-max 3 \
-                                --managed \
-                                --auto-kubeconfig
+                                --managed
                             
                             echo "✅ EKS cluster creation started (takes 10-15 minutes)"
                         fi
@@ -111,7 +110,6 @@ pipeline {
                     echo "🐳 Building Docker image..."
                     sh """
                         docker build -t ${DOCKER_IMAGE} .
-                        docker tag ${DOCKER_IMAGE} ${ECR_REPO_URI}:latest
                         echo "✅ Docker image built: ${DOCKER_IMAGE}"
                     """
                 }
@@ -126,15 +124,10 @@ pipeline {
                         # Login to ECR
                         aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO_URI}
                         
-                        # Push both tags
+                        # Push image
                         docker push ${DOCKER_IMAGE}
-                        docker push ${ECR_REPO_URI}:latest
                         
-                        echo "✅ Images pushed to ECR"
-                        
-                        # Verify push
-                        echo "=== ECR Images ==="
-                        aws ecr list-images --repository-name my-app --region ${AWS_REGION} --query 'imageIds[*].imageTag' --output table
+                        echo "✅ Image pushed to ECR"
                     """
                 }
             }
@@ -145,70 +138,22 @@ pipeline {
                 script {
                     echo "🚀 Deploying to EKS..."
                     sh """
-                        # Create updated deployment manifest with ECR image
-                        cat > k8s-deployment-${BUILD_NUMBER}.yaml << EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: nodejs-app
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: nodejs-app
-  template:
-    metadata:
-      labels:
-        app: nodejs-app
-    spec:
-      containers:
-      - name: nodejs-app
-        image: "${DOCKER_IMAGE}"
-        ports:
-          - containerPort: 3000
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
-            memory: "256Mi"
-            cpu: "200m"
-        livenessProbe:
-          httpGet:
-            path: /
-            port: 3000
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /
-            port: 3000
-          initialDelaySeconds: 10
-          periodSeconds: 5
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: nodejs-app
-  namespace: default
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: "external"
-    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
-spec:
-  selector:
-    app: nodejs-app
-  type: LoadBalancer
-  ports:
-  - name: http
-    targetPort: 3000
-    port: 80
-EOF
-
-                        # Apply the deployment
-                        kubectl apply -f k8s-deployment-${BUILD_NUMBER}.yaml
+                        # Create deployment using kubectl (simpler approach)
+                        kubectl create deployment ${APP_NAME} --image=${DOCKER_IMAGE} --dry-run=client -o yaml | kubectl apply -f -
                         
-                        # Wait for rollout to complete
-                        kubectl rollout status deployment/nodejs-app --timeout=300s
+                        # Expose service
+                        kubectl expose deployment ${APP_NAME} \
+                            --port=80 \
+                            --target-port=3000 \
+                            --type=LoadBalancer \
+                            --name=${APP_NAME}-service \
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Scale deployment
+                        kubectl scale deployment/${APP_NAME} --replicas=2
+                        
+                        # Wait for rollout
+                        kubectl rollout status deployment/${APP_NAME} --timeout=300s
                         
                         echo "✅ Application deployed successfully!"
                     """
@@ -222,33 +167,27 @@ EOF
                     echo "🔍 Verifying deployment..."
                     sh """
                         echo "=== Deployment Status ==="
-                        kubectl get deployment nodejs-app
+                        kubectl get deployment ${APP_NAME}
 
                         echo ""
                         echo "=== Pods Status ==="
-                        kubectl get pods -l app=nodejs-app
+                        kubectl get pods -l app=${APP_NAME}
 
                         echo ""
                         echo "=== Services ==="
-                        kubectl get service nodejs-app
-
-                        echo ""
-                        echo "=== Application Logs ==="
-                        kubectl logs -l app=nodejs-app --tail=10 || echo "Logs not available yet"
+                        kubectl get service ${APP_NAME}-service
 
                         echo ""
                         echo "=== LoadBalancer URL ==="
-                        SERVICE_URL=\$(kubectl get service nodejs-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+                        SERVICE_URL=\$(kubectl get service ${APP_NAME}-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
                         if [ ! -z "\$SERVICE_URL" ]; then
                             echo "🌐 Your Node.js app is available at: http://\$SERVICE_URL"
-                            echo ""
-                            echo "⏳ Testing application (waiting for LoadBalancer to be ready)..."
+                            echo "⏳ Waiting for LoadBalancer to be ready..."
                             sleep 30
-                            echo "Testing HTTP response..."
-                            curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" http://\$SERVICE_URL || echo "Application still starting up"
+                            echo "Testing application..."
+                            curl -s http://\$SERVICE_URL | head -5 || echo "Application still starting up"
                         else
-                            echo "LoadBalancer provisioning... Check in a few minutes with:"
-                            echo "kubectl get service nodejs-app"
+                            echo "LoadBalancer provisioning..."
                         fi
                     """
                 }
@@ -259,33 +198,12 @@ EOF
     post {
         always {
             echo "🏁 Pipeline ${currentBuild.currentResult}"
-            sh """
-                # Cleanup Docker images
-                docker rmi ${DOCKER_IMAGE} || true
-                docker rmi ${ECR_REPO_URI}:latest || true
-                docker system prune -f || true
-                
-                # Cleanup temporary files
-                rm -f k8s-deployment-*.yaml || true
-            """
         }
         success {
-            echo """
-            🎉 PIPELINE SUCCESS! 🎉
-            
-            Your Node.js Express app is now running on EKS!
-            
-            Quick Commands:
-            🔍 Check status: kubectl get all -l app=nodejs-app
-            📝 View logs: kubectl logs -l app=nodejs-app -f
-            🌐 Get URL: kubectl get service nodejs-app
-            📊 Monitor: kubectl top pods -l app=nodejs-app
-            
-            The EKS cluster will remain running for future deployments.
-            """
+            echo "🎉 Pipeline SUCCESS! Your Node.js app is running on EKS."
         }
         failure {
-            echo "❌ Pipeline failed. Check the logs above for details."
+            echo "❌ Pipeline failed. Check logs above for details."
         }
     }
 }
