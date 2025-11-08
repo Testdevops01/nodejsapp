@@ -12,37 +12,48 @@ pipeline {
 
     stages {
         stage('Create EKS Cluster with AWS CLI') {
-            steps {
-                script {
-                    echo "🚀 Creating EKS cluster: ${EKS_CLUSTER_NAME}"
-                    sh """
-                        # Check if cluster already exists
-                        if aws eks describe-cluster --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION} 2>/dev/null; then
-                            echo "✅ Cluster ${EKS_CLUSTER_NAME} already exists"
-                        else
-                            echo "Creating new EKS cluster using AWS CLI..."
-                            
-                            # Get default VPC and subnets
-                            VPC_ID=\$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query "Vpcs[0].VpcId" --output text)
-                            echo "Using VPC: \$VPC_ID"
-                            
-                            SUBNET_IDS=\$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=\$VPC_ID" --query "Subnets[0:2].SubnetId" --output text | tr '\\n' ',' | sed 's/,\$//')
-                            echo "Using subnets: \$SUBNET_IDS"
-                            
-                            # Create EKS cluster
-                            aws eks create-cluster \\
-                                --name ${EKS_CLUSTER_NAME} \\
-                                --region ${AWS_REGION} \\
-                                --kubernetes-version 1.28 \\
-                                --role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/JenkinsWorkerRole \\
-                                --resources-vpc-config subnetIds="\$SUBNET_IDS"
-                            
-                            echo "✅ EKS cluster creation started (takes 10-15 minutes)"
-                        fi
-                    """
-                }
+    steps {
+        script {
+            echo "🚀 Creating EKS cluster: jenkins-eks-demo"
+
+            // Check if cluster already exists
+            def clusterExists = sh(script: "aws eks describe-cluster --name jenkins-eks-demo --region us-east-1 >/dev/null 2>&1", returnStatus: true)
+
+            if (clusterExists == 0) {
+                echo "✅ EKS cluster 'jenkins-eks-demo' already exists. Skipping creation."
+            } else {
+                echo "Creating new EKS cluster using AWS CLI..."
+
+                // Get Default VPC
+                sh '''
+                set -e
+                REGION="us-east-1"
+                VPC_ID=$(aws ec2 describe-vpcs --region $REGION --filters Name=is-default,Values=true --query "Vpcs[0].VpcId" --output text)
+                echo "Using VPC: $VPC_ID"
+
+                # Get two subnets in that VPC and convert tabs to commas
+                SUBNET_IDS=$(aws ec2 describe-subnets --region $REGION --filters Name=vpc-id,Values=$VPC_ID --query "Subnets[0:2].SubnetId" --output text | tr "\\t" "," | tr -d " ")
+                echo "Using subnets: $SUBNET_IDS"
+
+                # Optional: Create security group if needed (example)
+                SG_ID=$(aws ec2 describe-security-groups --region $REGION --filters Name=vpc-id,Values=$VPC_ID --query "SecurityGroups[0].GroupId" --output text)
+                echo "Using security group: $SG_ID"
+
+                # Create the EKS Cluster
+                aws eks create-cluster \
+                    --name jenkins-eks-demo \
+                    --region $REGION \
+                    --kubernetes-version 1.28 \
+                    --role-arn arn:aws:iam::843559766730:role/JenkinsWorkerRole \
+                    --resources-vpc-config subnetIds=$SUBNET_IDS,securityGroupIds=$SG_ID
+
+                echo "✅ EKS cluster creation command submitted."
+                '''
             }
         }
+    }
+}
+
 
         stage('Wait for EKS Control Plane') {
             steps {
